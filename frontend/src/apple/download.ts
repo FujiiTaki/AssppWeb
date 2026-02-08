@@ -1,0 +1,189 @@
+import type { Account, Software, DownloadOutput, Sinf } from "../types";
+import { appleRequest } from "./request";
+import { buildPlist, parsePlist } from "./plist";
+import { mergeCookies, parseCookieHeaders } from "./cookies";
+import { storeAPIHost } from "./config";
+
+export class DownloadError extends Error {
+  constructor(
+    message: string,
+    public readonly code?: string,
+  ) {
+    super(message);
+    this.name = "DownloadError";
+  }
+}
+
+export async function getDownloadInfo(
+  account: Account,
+  app: Software,
+  externalVersionId?: string,
+): Promise<{ output: DownloadOutput; updatedCookies: typeof account.cookies }> {
+  const deviceId = account.deviceIdentifier;
+
+  let requestHost = storeAPIHost(account.pod);
+  let requestPath = `/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct?guid=${deviceId}`;
+  let cookies = [...account.cookies];
+  let redirectAttempt = 0;
+
+  while (redirectAttempt <= 3) {
+    const payload: Record<string, any> = {
+      creditDisplay: "",
+      guid: deviceId,
+      salableAdamId: app.id,
+    };
+
+    if (externalVersionId) {
+      payload.externalVersionId = externalVersionId;
+    }
+
+    const plistBody = buildPlist(payload);
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/x-apple-plist",
+      "iCloud-DSID": account.directoryServicesIdentifier,
+      "X-Dsid": account.directoryServicesIdentifier,
+    };
+
+    const response = await appleRequest({
+      method: "POST",
+      host: requestHost,
+      path: requestPath,
+      headers,
+      body: plistBody,
+      cookies,
+    });
+
+    const setCookies: string[] = [];
+    for (const [key, value] of response.rawHeaders) {
+      if (key.toLowerCase() === "set-cookie") {
+        setCookies.push(value);
+      }
+    }
+    if (setCookies.length > 0) {
+      cookies = mergeCookies(cookies, parseCookieHeaders(setCookies));
+    }
+
+    if (response.status === 302) {
+      const location = response.headers["location"];
+      if (!location) {
+        throw new DownloadError("Failed to retrieve redirect location");
+      }
+      const url = new URL(location);
+      requestHost = url.hostname;
+      requestPath = url.pathname + url.search;
+      redirectAttempt++;
+      continue;
+    }
+
+    const dict = parsePlist(response.body) as Record<string, any>;
+
+    if (dict.failureType) {
+      const failureType = String(dict.failureType);
+      const customerMessage = dict.customerMessage as string | undefined;
+      switch (failureType) {
+        case "2034":
+        case "2042":
+          throw new DownloadError("Password token is expired", failureType);
+        case "9610":
+          throw new DownloadError(
+            "License required - purchase the app first",
+            "9610",
+          );
+        default: {
+          if (customerMessage === "Your password has changed.") {
+            throw new DownloadError("Password token is expired", failureType);
+          }
+          throw new DownloadError(
+            customerMessage ?? `Download failed: ${failureType}`,
+            failureType,
+          );
+        }
+      }
+    }
+
+    const songList = dict.songList as Record<string, any>[] | undefined;
+    if (!songList || songList.length === 0) {
+      throw new DownloadError("No items in response");
+    }
+
+    const item = songList[0];
+    const url = item.URL as string;
+    if (!url) {
+      throw new DownloadError("Missing download URL");
+    }
+
+    const metadata = item.metadata as Record<string, any>;
+    if (!metadata) {
+      throw new DownloadError("Missing metadata");
+    }
+
+    const version = metadata.bundleShortVersionString as string;
+    const bundleVersion = metadata.bundleVersion as string;
+    if (!version || !bundleVersion) {
+      throw new DownloadError("Missing required version information");
+    }
+
+    const sinfs: Sinf[] = [];
+    const sinfData = item.sinfs as Record<string, any>[] | undefined;
+    if (sinfData) {
+      for (const sinfItem of sinfData) {
+        const id = sinfItem.id as number;
+        const sinf = sinfItem.sinf;
+        if (id !== undefined && sinf) {
+          let sinfBase64: string;
+          if (sinf instanceof Uint8Array || sinf instanceof ArrayBuffer) {
+            const bytes =
+              sinf instanceof ArrayBuffer ? new Uint8Array(sinf) : sinf;
+            sinfBase64 = base64FromBytes(bytes);
+          } else if (typeof sinf === "string") {
+            sinfBase64 = sinf;
+          } else {
+            throw new DownloadError("Invalid sinf item");
+          }
+          sinfs.push({ id, sinf: sinfBase64 });
+        }
+      }
+    }
+
+    if (sinfs.length === 0) {
+      throw new DownloadError("No sinf found in response");
+    }
+
+    // Build iTunesMetadata plist
+    const metadataDict: Record<string, any> = { ...metadata };
+    metadataDict["apple-id"] = account.email;
+    metadataDict["userName"] = account.email;
+    delete metadataDict.passwordToken;
+    delete metadataDict["passwordToken"];
+    const iTunesMetadata = base64FromString(buildPlist(metadataDict));
+
+    return {
+      output: {
+        downloadURL: url,
+        sinfs,
+        bundleShortVersionString: version,
+        bundleVersion,
+        iTunesMetadata,
+      },
+      updatedCookies: cookies,
+    };
+  }
+
+  throw new DownloadError("Too many redirects");
+}
+
+function base64FromString(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  return base64FromBytes(bytes);
+}
+
+function base64FromBytes(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}

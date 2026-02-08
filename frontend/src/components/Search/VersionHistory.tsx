@@ -1,0 +1,218 @@
+import { useState, useEffect } from "react";
+import { useParams, useLocation, useNavigate } from "react-router-dom";
+import PageContainer from "../Layout/PageContainer";
+import AppIcon from "../common/AppIcon";
+import { useAccounts } from "../../hooks/useAccounts";
+import { useSettingsStore } from "../../store/settings";
+import { listVersions } from "../../apple/versionFinder";
+import { getVersionMetadata } from "../../apple/versionLookup";
+import { getDownloadInfo } from "../../apple/download";
+import { apiPost } from "../../api/client";
+import { accountHash } from "../../utils/account";
+import type { Software, VersionMetadata } from "../../types";
+
+export default function VersionHistory() {
+  const { appId } = useParams<{ appId: string }>();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { accounts, updateAccount } = useAccounts();
+  const { defaultCountry } = useSettingsStore();
+
+  const stateApp = (location.state as { app?: Software; country?: string })
+    ?.app;
+  const stateCountry = (location.state as { country?: string })?.country;
+  const country = stateCountry ?? defaultCountry;
+
+  const [app] = useState<Software | null>(stateApp ?? null);
+  const [selectedAccount, setSelectedAccount] = useState("");
+  const [versions, setVersions] = useState<string[]>([]);
+  const [versionMeta, setVersionMeta] = useState<
+    Record<string, VersionMetadata>
+  >({});
+  const [loading, setLoading] = useState(false);
+  const [loadingMeta, setLoadingMeta] = useState<Record<string, boolean>>({});
+  const [downloadingVersion, setDownloadingVersion] = useState<string | null>(
+    null,
+  );
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  useEffect(() => {
+    if (accounts.length > 0 && !selectedAccount) {
+      setSelectedAccount(accounts[0].email);
+    }
+  }, [accounts, selectedAccount]);
+
+  const account = accounts.find((a) => a.email === selectedAccount);
+
+  async function handleLoadVersions() {
+    if (!account || !app) return;
+    setLoading(true);
+    setError("");
+    try {
+      const result = await listVersions(account, app);
+      setVersions(result.versions);
+      await updateAccount({ ...account, cookies: result.updatedCookies });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load versions");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleLoadMeta(versionId: string) {
+    if (!account || !app || versionMeta[versionId]) return;
+    setLoadingMeta((prev) => ({ ...prev, [versionId]: true }));
+    try {
+      const result = await getVersionMetadata(account, app, versionId);
+      setVersionMeta((prev) => ({ ...prev, [versionId]: result.metadata }));
+      await updateAccount({ ...account, cookies: result.updatedCookies });
+    } catch {
+      // Silently fail for individual version metadata
+    } finally {
+      setLoadingMeta((prev) => ({ ...prev, [versionId]: false }));
+    }
+  }
+
+  async function handleDownloadVersion(versionId: string) {
+    if (!account || !app) return;
+    setDownloadingVersion(versionId);
+    setError("");
+    setSuccess("");
+    try {
+      const { output, updatedCookies } = await getDownloadInfo(
+        account,
+        app,
+        versionId,
+      );
+      await updateAccount({ ...account, cookies: updatedCookies });
+      const hash = await accountHash(account);
+      const versionedSoftware = {
+        ...app,
+        version: output.bundleShortVersionString,
+      };
+      await apiPost("/api/downloads", {
+        software: versionedSoftware,
+        accountHash: hash,
+        downloadURL: output.downloadURL,
+        sinfs: output.sinfs,
+        iTunesMetadata: output.iTunesMetadata,
+      });
+      navigate("/downloads");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Download failed");
+    } finally {
+      setDownloadingVersion(null);
+    }
+  }
+
+  if (!app) {
+    return (
+      <PageContainer title="Version History">
+        <p className="text-gray-500">
+          App information is not available. Please navigate from the search
+          page.
+        </p>
+      </PageContainer>
+    );
+  }
+
+  return (
+    <PageContainer title="Version History">
+      <div className="space-y-6">
+        <div className="flex items-center gap-4">
+          <AppIcon url={app.artworkUrl} name={app.name} size="md" />
+          <div>
+            <h2 className="font-medium text-gray-900">{app.name}</h2>
+            <p className="text-sm text-gray-500">{app.bundleID}</p>
+          </div>
+        </div>
+
+        {error && (
+          <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
+            {error}
+          </div>
+        )}
+        {success && (
+          <div className="p-3 bg-green-50 border border-green-200 rounded-lg text-sm text-green-700">
+            {success}
+          </div>
+        )}
+
+        {accounts.length > 0 && (
+          <div className="flex items-end gap-3">
+            <div className="flex-1">
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Account
+              </label>
+              <select
+                value={selectedAccount}
+                onChange={(e) => setSelectedAccount(e.target.value)}
+                className="rounded-md border border-gray-300 px-3 py-2 text-base w-full focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+              >
+                {accounts.map((a) => (
+                  <option key={a.email} value={a.email}>
+                    {a.firstName} {a.lastName} ({a.email})
+                  </option>
+                ))}
+              </select>
+            </div>
+            <button
+              onClick={handleLoadVersions}
+              disabled={loading || !account}
+              className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors whitespace-nowrap"
+            >
+              {loading ? "Loading..." : "Load Versions"}
+            </button>
+          </div>
+        )}
+
+        {versions.length > 0 && (
+          <div className="bg-white rounded-lg border border-gray-200 divide-y divide-gray-200">
+            {versions.map((versionId) => {
+              const meta = versionMeta[versionId];
+              const isLoadingMeta = loadingMeta[versionId];
+              const isDownloading = downloadingVersion === versionId;
+
+              return (
+                <div
+                  key={versionId}
+                  className="p-4 flex items-center justify-between"
+                >
+                  <div>
+                    <p className="text-sm font-medium text-gray-900">
+                      {meta ? `v${meta.displayVersion}` : `ID: ${versionId}`}
+                    </p>
+                    {meta && (
+                      <p className="text-xs text-gray-500">
+                        {new Date(meta.releaseDate).toLocaleDateString()}
+                      </p>
+                    )}
+                    {!meta && !isLoadingMeta && (
+                      <button
+                        onClick={() => handleLoadMeta(versionId)}
+                        className="text-xs text-blue-600 hover:text-blue-700 py-1"
+                      >
+                        Load details
+                      </button>
+                    )}
+                    {isLoadingMeta && (
+                      <span className="text-xs text-gray-400">Loading...</span>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => handleDownloadVersion(versionId)}
+                    disabled={isDownloading || downloadingVersion !== null}
+                    className="px-3 py-2 bg-blue-600 text-white text-sm font-medium rounded-md hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                  >
+                    {isDownloading ? "Downloading..." : "Download"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </PageContainer>
+  );
+}

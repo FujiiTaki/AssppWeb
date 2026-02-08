@@ -1,0 +1,130 @@
+import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import PageContainer from "../Layout/PageContainer";
+import { useAccounts } from "../../hooks/useAccounts";
+import { accountHash } from "../../utils/account";
+
+interface Stats {
+  accounts: number;
+  downloads: number;
+  packages: number;
+}
+
+export default function HomePage() {
+  const { accounts } = useAccounts();
+  const [stats, setStats] = useState<Stats>({
+    accounts: 0,
+    downloads: 0,
+    packages: 0,
+  });
+
+  useEffect(() => {
+    setStats((prev) => ({ ...prev, accounts: accounts.length }));
+
+    if (accounts.length === 0) {
+      setStats((prev) => ({ ...prev, downloads: 0, packages: 0 }));
+      return;
+    }
+
+    let cancelled = false;
+
+    (async () => {
+      const hashes = await Promise.all(accounts.map((a) => accountHash(a)));
+      if (cancelled) return;
+
+      const params = new URLSearchParams({
+        accountHashes: hashes.join(","),
+      });
+
+      const [downloads, packages] = await Promise.all([
+        fetch(`/api/downloads?${params}`)
+          .then((r) => (r.ok ? r.json() : []))
+          .catch(() => []),
+        fetch(`/api/packages?${params}`)
+          .then((r) => (r.ok ? r.json() : []))
+          .catch(() => []),
+      ]);
+
+      if (cancelled) return;
+
+      setStats((prev) => ({
+        ...prev,
+        downloads: Array.isArray(downloads) ? downloads.length : 0,
+        packages: Array.isArray(packages) ? packages.length : 0,
+      }));
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [accounts]);
+
+  return (
+    <PageContainer>
+      <div className="space-y-8">
+        <div>
+          <h1 className="text-3xl font-bold text-gray-900">
+            Welcome to Asspp Web
+          </h1>
+          <p className="mt-2 text-gray-600">
+            Manage Apple accounts, search the App Store, and download apps from
+            your browser.
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <StatCard label="Accounts" value={stats.accounts} />
+          <StatCard label="Downloads" value={stats.downloads} />
+          <StatCard label="Packages" value={stats.packages} />
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          <ActionCard
+            to="/accounts/add"
+            title="Add Account"
+            description="Sign in with an Apple ID to get started."
+          />
+          <ActionCard
+            to="/search"
+            title="Search Apps"
+            description="Find apps on the App Store by name or ID."
+          />
+          <ActionCard
+            to="/downloads"
+            title="View Downloads"
+            description="Check download progress and manage packages."
+          />
+        </div>
+      </div>
+    </PageContainer>
+  );
+}
+
+function StatCard({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="bg-white rounded-lg border border-gray-200 p-5">
+      <p className="text-sm font-medium text-gray-500">{label}</p>
+      <p className="mt-1 text-2xl font-bold text-gray-900">{value}</p>
+    </div>
+  );
+}
+
+function ActionCard({
+  to,
+  title,
+  description,
+}: {
+  to: string;
+  title: string;
+  description: string;
+}) {
+  return (
+    <Link
+      to={to}
+      className="block bg-white rounded-lg border border-gray-200 p-5 hover:border-blue-300 hover:shadow-sm transition-all"
+    >
+      <h3 className="text-sm font-semibold text-gray-900">{title}</h3>
+      <p className="mt-1 text-sm text-gray-500">{description}</p>
+    </Link>
+  );
+}
